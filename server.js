@@ -2,8 +2,53 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const net = require('net');
+
+// Ensure Nmap is in PATH (Windows)
+if (process.platform === 'win32') {
+  const nmapDir = 'C:\\Program Files (x86)\\Nmap';
+  if (fs.existsSync(nmapDir) && !process.env.PATH.includes(nmapDir)) {
+    process.env.PATH = `${process.env.PATH};${nmapDir}`;
+  }
+}
+
 
 const PORT = 3000;
+
+async function runFallbackScanner(target, res) {
+  res.write(`[Notice] Nmap executable not found. Using fallback Node.js TCP scanner for ${target}...\n\n`);
+  res.write(`PORT     STATE  SERVICE\n`);
+  const ports = { 21: 'ftp', 22: 'ssh', 23: 'telnet', 25: 'smtp', 53: 'domain', 80: 'http', 443: 'https', 3306: 'mysql', 3389: 'rdp', 8080: 'http-proxy' };
+  
+  for (const [port, svc] of Object.entries(ports)) {
+    await new Promise(resolve => {
+      const socket = new net.Socket();
+      socket.setTimeout(1000);
+      let status = 'filtered';
+      
+      socket.on('connect', () => {
+        status = 'open';
+        socket.destroy();
+      });
+      socket.on('timeout', () => {
+        socket.destroy();
+      });
+      socket.on('error', (err) => {
+        if (err.code === 'ECONNREFUSED') status = 'closed';
+        socket.destroy();
+      });
+      socket.on('close', () => {
+        let colorCode = '';
+        res.write(`${port.toString().padEnd(8)} ${status.padEnd(6)} ${svc}\n`);
+        resolve();
+      });
+      
+      socket.connect(port, target);
+    });
+  }
+  res.write(`\nScan complete.\n`);
+  res.end();
+}
 
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
@@ -33,12 +78,16 @@ const server = http.createServer((req, res) => {
           'Transfer-Encoding': 'chunked'
         });
 
-        // Basic argument parsing
-        // This splits by whitespace but handles simple cases.
-        // For a more robust solution in a real app, use a proper shell arg parser.
         const args = command.trim().split(/\s+/).slice(1);
-        
+        let target = args[args.length - 1];
+        if (target && target.startsWith('-')) target = '127.0.0.1'; // basic fallback
+
         const nmap = spawn('nmap', args);
+        let spawned = false;
+
+        nmap.on('spawn', () => {
+          spawned = true;
+        });
 
         nmap.stdout.on('data', (data) => {
           res.write(data);
@@ -49,13 +98,19 @@ const server = http.createServer((req, res) => {
         });
 
         nmap.on('close', (code) => {
-          res.write(`\nProcess exited with code ${code}\n`);
-          res.end();
+          if (spawned) {
+            res.write(`\nProcess exited with code ${code}\n`);
+            res.end();
+          }
         });
 
         nmap.on('error', (err) => {
-          res.write(`\nError: ${err.message}\nMake sure nmap is installed and in your PATH.\n`);
-          res.end();
+          if (err.code === 'ENOENT') {
+            runFallbackScanner(target, res);
+          } else {
+            res.write(`\nError: ${err.message}\n`);
+            res.end();
+          }
         });
       } catch (err) {
         res.writeHead(400);
